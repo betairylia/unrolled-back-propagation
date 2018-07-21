@@ -4,8 +4,8 @@ from tensorlayer.layers import *
 
 def network(input_data, output_dim, network_structure, is_train = False, reuse = False, use_BN = False, act = tf.nn.tanh):
 
-    w_init = tf.random_normal_initializer(stddev=0.02)
-    b_init = None  # tf.constant_initializer(value=0.0)
+    w_init = tf.random_normal_initializer(stddev=0.5)
+    b_init = tf.random_normal_initializer(stddev=0.5)
     g_init = tf.random_normal_initializer(1., 0.02)
     lrelu = lambda x: tl.act.lrelu(x, 0.2)
 
