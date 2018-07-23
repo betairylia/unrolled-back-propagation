@@ -14,6 +14,8 @@ from toy_model import network
 from data_generation import *
 from tensorlayer.prepro import *
 
+from tf.keras.optimizers import Adam
+
 from termcolor import colored, cprint
 
 import matplotlib.pyplot as plt
@@ -27,6 +29,7 @@ parser.add_argument('-adam', '--adam', dest='adam', action='store_const', const=
 parser.add_argument('-l', '--loops', type=float, default = 3.0, help='Loops count of input data')
 parser.add_argument('-sig', '--noise-sigma', type=float, default = 0.01, help='Sigma of the noise distributaion')
 parser.add_argument('-nn', '--nn-structure', nargs='*', type=int, help='The structure of the network, e.g. 30 20 10 8')
+parser.add_argument('-u', '--unrolled', type=int, default = 5, help='Count of unrolling steps')
 parser.add_argument('-lrelu', dest='activation', action='store_const', const=(lambda x: tl.act.lrelu(x, 0.2)), default=tf.nn.tanh, help='Use lRelu activation instead of tanh')
 
 args = parser.parse_args()
@@ -76,6 +79,30 @@ plt.clf()
 loss_epochs = np.zeros((num_epochs, 1))
 acc_epochs = np.zeros((num_epochs, 1))
 
+# borrowed from https://github.com/poolio/unrolled_gan/blob/master/Unrolled%20GAN%20demo.ipynb
+def extract_update_dict(update_ops):
+    """Extract variables and their new values from Assign and AssignAdd ops.
+     
+    Args:
+        update_ops: list of Assign and AssignAdd ops, typically computed using Keras' opt.get_updates()
+ 
+    Returns:
+        dict mapping from variable values to their updated value
+    """
+    name_to_var = {v.name: v for v in tf.global_variables()}
+    updates = OrderedDict()
+    for update in update_ops:
+        var_name = update.op.inputs[0].name
+        var = name_to_var[var_name]
+        value = update.op.inputs[1]
+        if update.op.type == 'Assign':
+            updates[var.value()] = value
+        elif update.op.type == 'AssignAdd':
+            updates[var.value()] = var + value
+        else:
+            raise ValueError("Update op type (%s) must be of type Assign or AssignAdd"%update_op.op.type)
+    return updates
+
 def train():
     input_x = tf.placeholder('float32', [batch_size, input_dim], name = "input")
     label_y = tf.placeholder('float32', [batch_size, output_dim], name = "label")
@@ -85,11 +112,37 @@ def train():
     loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(logits = logit_train, labels = label_y))
     n_vars = tl.layers.get_variables_with_name('network', True, True)
 
-    if args.adam == True:
-        optimizer = tf.train.AdamOptimizer()
-    else:
-        optimizer = tf.train.MomentumOptimizer(learning_rate = learning_rate, momentum = alpha)
-    train_op = optimizer.minimize(loss, var_list = n_vars)
+    # collect variables
+    trainable_vars = []
+    for i in range(0, len(network_structure) + 1):
+        trainable_vars.append(tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "network/layer_%d" % i))
+
+    # borrowed from https://github.com/poolio/unrolled_gan/blob/master/Unrolled%20GAN%20demo.ipynb
+    # unrolled bp
+    keras_opt = Adam()
+    optimizer = tf.train.AdamOptimizer()
+    layer_train_ops = []
+    unrolled_loss = []
+    for i in range(0, len(network_structure) + 1):
+
+        # get the trainable variables
+        except_layer_i = []
+        for j in range(0, len(network_structure) + 1):
+            if i != j:
+                except_layer_i += trainable_vars[i]
+        
+        # Unrolled update
+        updates = keras_opt.get_updates(loss, except_layer_i)
+        update_dict = extract_update_dict(updates)
+        cur_update_dict = update_dict
+        
+        for i in range(args.unrolled - 1):
+            # Compute variable updates given the previous iteration's updated variable
+            cur_update_dict = graph_replace(update_dict, cur_update_dict)
+        
+        # Final unrolled loss uses the parameters at the last time step
+        unrolled_loss.append(graph_replace(loss, cur_update_dict))
+        layer_train_ops.append(optimizer.minimize(unrolled_loss, var_list = trainable_vars[i]))
 
     input_preview = tf.placeholder('float32', [classification_preview_size ** 2, input_dim], name = "input_preview")
 
@@ -111,8 +164,10 @@ def train():
         for step, (_x, _y) in enumerate(epoch):
             
             # Train
-            _, n_loss = sess.run([train_op, loss], feed_dict={input_x: _x, label_y: _y})
-            training_loss += n_loss
+            for layer in range(0, len(network_structure) + 1):
+                _, n_loss = sess.run([layer_train_ops[layer], unrolled_loss[layer]], feed_dict={input_x: _x, label_y: _y})
+                training_loss += n_loss
+            training_loss /= (len(network_structure) + 1)
 
             # Test
             t_x, t_y = gen_data(batch_size, args.noise_sigma, 1.0 / (math.pi * args.loops))
