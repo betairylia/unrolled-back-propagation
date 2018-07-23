@@ -6,6 +6,8 @@ import time
 import math
 import argparse
 
+from collections import OrderedDict
+
 import random
 import sys
 import os
@@ -14,7 +16,7 @@ from toy_model import network
 from data_generation import *
 from tensorlayer.prepro import *
 
-from tf.keras.optimizers import Adam
+from tensorflow.keras.optimizers import Adam
 
 from termcolor import colored, cprint
 
@@ -23,6 +25,7 @@ import matplotlib.pyplot as plt
 parser = argparse.ArgumentParser(description="Run simple NN test with 100 epochs and save the results.")
 parser.add_argument('outpath')
 parser.add_argument('-gpu', '--cuda-gpus')
+parser.add_argument('-log', '--log_dir')
 parser.add_argument('-lr', '--learning-rate', type=float, default = 0.003, help='Learning rate for momentum SGD')
 parser.add_argument('-alpha', '--alpha', type=float, default = 0.9, help='momentum')
 parser.add_argument('-adam', '--adam', dest='adam', action='store_const', const=True, default=False, help='Use Adam instead of momentum SGD')
@@ -45,7 +48,7 @@ if args.activation == tf.nn.tanh:
 else:
     act_str = "lRelu"
 
-name = args.outpath.split(' ')[0] + "/Standard-%s(%s-%s)-[lp%1.1f-sig%.2f]" % (method_str, act_str, structure_str, args.loops, args.noise_sigma)
+name = args.outpath.split(' ')[0] + "/Unrolled[%d]-%s(%s-%s)-[lp%1.1f-sig%.2f]" % (args.unrolled, method_str, act_str, structure_str, args.loops, args.noise_sigma)
 cprint("Output Path: " + name, 'green')
 
 os.system("del /F /Q \"" + name + "\\\"")
@@ -91,16 +94,18 @@ def extract_update_dict(update_ops):
     """
     name_to_var = {v.name: v for v in tf.global_variables()}
     updates = OrderedDict()
+    # print(tf.global_variables())
     for update in update_ops:
+        # print(update.op)
         var_name = update.op.inputs[0].name
         var = name_to_var[var_name]
         value = update.op.inputs[1]
-        if update.op.type == 'Assign':
+        if update.op.type == 'Assign' or update.op.type == 'AssignVariableOp':
             updates[var.value()] = value
-        elif update.op.type == 'AssignAdd':
+        elif update.op.type == 'AssignAdd' or update.op.type == 'AssignAddVariableOp':
             updates[var.value()] = var + value
         else:
-            raise ValueError("Update op type (%s) must be of type Assign or AssignAdd"%update_op.op.type)
+            raise ValueError("Update op type (%s) must be of type Assign(VariableOp) or AssignAdd(VariableOp)" % update.op.type)
     return updates
 
 def train():
@@ -132,17 +137,19 @@ def train():
                 except_layer_i += trainable_vars[i]
         
         # Unrolled update
+        # updates = keras_opt.get_updates(loss, except_layer_i)
         updates = keras_opt.get_updates(loss, except_layer_i)
+        # print(updates)
         update_dict = extract_update_dict(updates)
         cur_update_dict = update_dict
         
-        for i in range(args.unrolled - 1):
+        for j in range(args.unrolled - 1):
             # Compute variable updates given the previous iteration's updated variable
-            cur_update_dict = graph_replace(update_dict, cur_update_dict)
+            cur_update_dict = tf.contrib.graph_editor.graph_replace(update_dict, cur_update_dict)
         
         # Final unrolled loss uses the parameters at the last time step
-        unrolled_loss.append(graph_replace(loss, cur_update_dict))
-        layer_train_ops.append(optimizer.minimize(unrolled_loss, var_list = trainable_vars[i]))
+        unrolled_loss.append(tf.contrib.graph_editor.graph_replace(loss, cur_update_dict))
+        layer_train_ops.append(optimizer.minimize(unrolled_loss[i], var_list = trainable_vars[i]))
 
     input_preview = tf.placeholder('float32', [classification_preview_size ** 2, input_dim], name = "input_preview")
 
@@ -153,8 +160,13 @@ def train():
     acc, acc_op = tf.metrics.accuracy(labels = tf.argmax(label_y, 1), predictions = tf.argmax(logit_test, 1))
 
     sess = tf.Session()
+
+    writter = tf.summary.FileWriter(args.log_dir, sess.graph)
+
     sess.run(tf.local_variables_initializer())
     tl.layers.initialize_global_variables(sess)
+
+    writter.close()
 
     for idx, epoch in enumerate(gen_epochs(num_epochs, dataCount, batch_size, input_dim, output_dim, args.loops, args.noise_sigma)):
         
