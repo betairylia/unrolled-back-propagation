@@ -187,7 +187,7 @@ def train():
                 plt.plot(ax, ao, label = i)
             
             plt.legend()
-            plt.savefig(act_out_name + "/Act_Eppre%d_It%d.png" % (idx, step))
+            plt.savefig(act_out_name + "/Act_Ep%d_It%d.png" % (idx, step))
             plt.clf()
 
         for idx, epoch in enumerate(gen_epochs(num_epochs, dataCount, batch_size, input_dim, output_dim, args.loops, args.noise_sigma)):

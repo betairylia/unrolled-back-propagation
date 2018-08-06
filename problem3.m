@@ -20,6 +20,9 @@ K = zeros(n, n);
 ita = 0.1;
 lambda = 1;
 
+% x(i, :) is a row vector, so its transpose is Xi
+% so it is x(i, :) * x(j, :)' for Xi'Xj.
+
 for i = 1 : 40
     for j = 1 : 40
         K(i, j) = y(i) * y(j) * (x(i, :) * x(j, :)');
