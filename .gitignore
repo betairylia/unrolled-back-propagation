@@ -106,3 +106,12 @@ venv.bak/
 # results
 preview/
 logs/
+unrolled_exp/
+new_exp/
+unroll_heavy_test_adam/
+unroll_test_bn/
+unroll0_test/
+unroll0_test_adam/
+unroll5_test_adam/
+advanced_Act_test/
+Figures/

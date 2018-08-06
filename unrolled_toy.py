@@ -16,8 +16,6 @@ from toy_model import network
 from data_generation import *
 from tensorlayer.prepro import *
 
-from tensorflow.keras.optimizers import Adam
-
 from termcolor import colored, cprint
 
 import matplotlib.pyplot as plt
@@ -25,14 +23,18 @@ import matplotlib.pyplot as plt
 parser = argparse.ArgumentParser(description="Run simple NN test with 100 epochs and save the results.")
 parser.add_argument('outpath')
 parser.add_argument('-gpu', '--cuda-gpus')
-parser.add_argument('-log', '--log_dir')
+parser.add_argument('-log', '--log_dir', default = 'logs\\')
 parser.add_argument('-lr', '--learning-rate', type=float, default = 0.003, help='Learning rate for momentum SGD')
 parser.add_argument('-alpha', '--alpha', type=float, default = 0.9, help='momentum')
 parser.add_argument('-adam', '--adam', dest='adam', action='store_const', const=True, default=False, help='Use Adam instead of momentum SGD')
+parser.add_argument('-bn', '--batchnorm', dest='batchnorm', action='store_const', const=True, default=False, help='Use BatchNorm or not')
 parser.add_argument('-l', '--loops', type=float, default = 3.0, help='Loops count of input data')
 parser.add_argument('-sig', '--noise-sigma', type=float, default = 0.01, help='Sigma of the noise distributaion')
 parser.add_argument('-nn', '--nn-structure', nargs='*', type=int, help='The structure of the network, e.g. 30 20 10 8')
 parser.add_argument('-u', '--unrolled', type=int, default = 5, help='Count of unrolling steps')
+parser.add_argument('-avg', '--average', type=int, default = 1, help='How many times should the network try to get an average loss & acc')
+parser.add_argument('-data', '--datacount', type=int, default = 65536, help='How many data should be generated in an epoch')
+parser.add_argument('-bs', '--batchsize', type=int, default = 128, help='Mini-batch size')
 parser.add_argument('-lrelu', dest='activation', action='store_const', const=(lambda x: tl.act.lrelu(x, 0.2)), default=tf.nn.tanh, help='Use lRelu activation instead of tanh')
 
 args = parser.parse_args()
@@ -48,7 +50,7 @@ if args.activation == tf.nn.tanh:
 else:
     act_str = "lRelu"
 
-name = args.outpath.split(' ')[0] + "/Unrolled[%d]-%s(%s-%s)-[lp%1.1f-sig%.2f]" % (args.unrolled, method_str, act_str, structure_str, args.loops, args.noise_sigma)
+name = args.outpath.split(' ')[0] + "/(avg%d)Unrolled[%d]-%s(%s-%s)-[lp%1.1f-sig%.2f]" % (args.average, args.unrolled, method_str, act_str, structure_str, args.loops, args.noise_sigma)
 cprint("Output Path: " + name, 'green')
 
 os.system("del /F /Q \"" + name + "\\\"")
@@ -61,11 +63,12 @@ input_dim = 2
 output_dim = 2
 network_structure = args.nn_structure
 
+totalLoops = args.average
 num_epochs = 100
-batch_size = 128
+batch_size = args.batchsize
 learning_rate = args.learning_rate
 alpha = args.alpha
-dataCount = 65536
+dataCount = args.datacount
 
 classification_preview_size = 128
 
@@ -96,7 +99,6 @@ def extract_update_dict(update_ops):
     updates = OrderedDict()
     # print(tf.global_variables())
     for update in update_ops:
-        # print(update.op)
         var_name = update.op.inputs[0].name
         var = name_to_var[var_name]
         value = update.op.inputs[1]
@@ -108,11 +110,23 @@ def extract_update_dict(update_ops):
             raise ValueError("Update op type (%s) must be of type Assign(VariableOp) or AssignAdd(VariableOp)" % update.op.type)
     return updates
 
+_graph_replace = tf.contrib.graph_editor.graph_replace
+
+def remove_original_op_attributes(graph):
+    """Remove _original_op attribute from all operations in a graph."""
+    for op in graph.get_operations():
+        op._original_op = None
+        
+def graph_replace(*args, **kwargs):
+    """Monkey patch graph_replace so that it works with TF 1.0"""
+    remove_original_op_attributes(tf.get_default_graph())
+    return _graph_replace(*args, **kwargs)
+
 def train():
     input_x = tf.placeholder('float32', [batch_size, input_dim], name = "input")
     label_y = tf.placeholder('float32', [batch_size, output_dim], name = "label")
 
-    net, logit_train = network(input_x, output_dim, network_structure, act=args.activation, is_train = True, reuse = False)
+    net, logit_train = network(input_x, output_dim, network_structure, act=args.activation, is_train = True, reuse = False, use_BN = args.batchnorm)
 
     loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(logits = logit_train, labels = label_y))
     n_vars = tl.layers.get_variables_with_name('network', True, True)
@@ -124,8 +138,16 @@ def train():
 
     # borrowed from https://github.com/poolio/unrolled_gan/blob/master/Unrolled%20GAN%20demo.ipynb
     # unrolled bp
-    keras_opt = Adam()
-    optimizer = tf.train.AdamOptimizer()
+    if args.adam == True:
+        keras_opt = tf.keras.optimizers.Adam()
+    else:
+        keras_opt = tf.keras.optimizers.SGD(lr = learning_rate, momentum = alpha)
+
+    if args.adam == True:
+        optimizer = tf.train.AdamOptimizer()
+    else:
+        optimizer = tf.train.MomentumOptimizer(learning_rate = learning_rate, momentum = alpha)
+
     layer_train_ops = []
     unrolled_loss = []
     for i in range(0, len(network_structure) + 1):
@@ -136,82 +158,89 @@ def train():
             if i != j:
                 except_layer_i += trainable_vars[i]
         
-        # Unrolled update
-        # updates = keras_opt.get_updates(loss, except_layer_i)
-        updates = keras_opt.get_updates(loss, except_layer_i)
-        # print(updates)
-        update_dict = extract_update_dict(updates)
-        cur_update_dict = update_dict
-        
-        for j in range(args.unrolled - 1):
-            # Compute variable updates given the previous iteration's updated variable
-            cur_update_dict = tf.contrib.graph_editor.graph_replace(update_dict, cur_update_dict)
-        
-        # Final unrolled loss uses the parameters at the last time step
-        unrolled_loss.append(tf.contrib.graph_editor.graph_replace(loss, cur_update_dict))
+        if args.unrolled > 0:
+            # Unrolled update
+            # updates = keras_opt.get_updates(loss, except_layer_i)
+            updates = keras_opt.get_updates(loss, except_layer_i)
+            # print(updates)
+            update_dict = extract_update_dict(updates)
+            cur_update_dict = update_dict
+            
+            for j in range(args.unrolled - 1):
+                # Compute variable updates given the previous iteration's updated variable
+                cur_update_dict = tf.contrib.graph_editor.graph_replace(update_dict, cur_update_dict)
+                # cur_update_dict will be: cur_update_dict[values for (unrolled step) k = 0] = values for k = j
+            
+            # Final unrolled loss uses the parameters at the last time step
+            unrolled_loss.append(tf.contrib.graph_editor.graph_replace(loss, cur_update_dict))
+        else:
+            unrolled_loss.append(loss)
         layer_train_ops.append(optimizer.minimize(unrolled_loss[i], var_list = trainable_vars[i]))
 
     input_preview = tf.placeholder('float32', [classification_preview_size ** 2, input_dim], name = "input_preview")
 
-    _, logit_preview = network(input_preview, output_dim, network_structure, act=args.activation, is_train = True, reuse = True)
+    _, logit_preview = network(input_preview, output_dim, network_structure, act=args.activation, is_train = False, reuse = True, use_BN = args.batchnorm)
     preview_softmax = tf.nn.softmax(logit_preview)
 
-    _, logit_test = network(input_x, output_dim, network_structure, act=args.activation, is_train = True, reuse = True)
+    _, logit_test = network(input_x, output_dim, network_structure, act=args.activation, is_train = False, reuse = True, use_BN = args.batchnorm)
     acc, acc_op = tf.metrics.accuracy(labels = tf.argmax(label_y, 1), predictions = tf.argmax(logit_test, 1))
 
     sess = tf.Session()
 
     writter = tf.summary.FileWriter(args.log_dir, sess.graph)
 
-    sess.run(tf.local_variables_initializer())
-    tl.layers.initialize_global_variables(sess)
-
     writter.close()
 
-    for idx, epoch in enumerate(gen_epochs(num_epochs, dataCount, batch_size, input_dim, output_dim, args.loops, args.noise_sigma)):
+    for loopCount in range(totalLoops):
         
-        training_loss = 0
-        total_acc = 0
-        
-        for step, (_x, _y) in enumerate(epoch):
+        print(colored("Loop %d" % (loopCount), 'yellow'))
+
+        sess.run(tf.local_variables_initializer())
+        tl.layers.initialize_global_variables(sess)
+
+        for idx, epoch in enumerate(gen_epochs(num_epochs, dataCount, batch_size, input_dim, output_dim, args.loops, args.noise_sigma)):
             
-            # Train
-            for layer in range(0, len(network_structure) + 1):
-                _, n_loss = sess.run([layer_train_ops[layer], unrolled_loss[layer]], feed_dict={input_x: _x, label_y: _y})
-                training_loss += n_loss
-            training_loss /= (len(network_structure) + 1)
+            training_loss = 0
+            total_acc = 0
+            
+            for step, (_x, _y) in enumerate(epoch):
+                
+                # Train
+                for layer in range(0, len(network_structure) + 1):
+                    _, n_loss = sess.run([layer_train_ops[layer], unrolled_loss[layer]], feed_dict={input_x: _x, label_y: _y})
+                    training_loss += n_loss / (len(network_structure) + 1)
 
-            # Test
-            t_x, t_y = gen_data(batch_size, args.noise_sigma, 1.0 / (math.pi * args.loops))
-            _, n_acc = sess.run([acc, acc_op], feed_dict={input_x: t_x, label_y: t_y})
-            total_acc += n_acc
+                # Test
+                t_x, t_y = gen_data(batch_size, args.noise_sigma, 1.0 / (math.pi * args.loops))
+                _, n_acc = sess.run([acc, acc_op], feed_dict={input_x: t_x, label_y: t_y})
+                total_acc += n_acc
 
-            print(colored("Epoch %3d, Iteration %6d: loss = %.8f, acc = %.8f" % (idx, step, n_loss, n_acc), 'cyan'))
+                print(colored("Loop #%2d - " % loopCount, 'yellow') + colored("Epoch %3d, Iteration %6d: loss = %.8f, acc = %.8f" % (idx, step, n_loss, n_acc), 'cyan'))
 
-        # Preview
-        lx = np.linspace(1, -1, classification_preview_size)
-        ly = np.linspace(-1, 1, classification_preview_size)
-        mx, my = np.meshgrid(ly, lx)
-        preview_X = np.array([mx.flatten(), my.flatten()]).T
-        preview_blends = sess.run(preview_softmax, feed_dict = {input_preview: preview_X})
+            # Preview
+            lx = np.linspace(1, -1, classification_preview_size)
+            ly = np.linspace(-1, 1, classification_preview_size)
+            mx, my = np.meshgrid(ly, lx)
+            preview_X = np.array([mx.flatten(), my.flatten()]).T
+            preview_blends = sess.run(preview_softmax, feed_dict = {input_preview: preview_X})
 
-        color_0 = np.array([0, 0, 1])
-        color_1 = np.array([1, 0, 0])
+            color_0 = np.array([0, 0, 1])
+            color_1 = np.array([1, 0, 0])
 
-        preview_result = np.zeros((1, classification_preview_size, classification_preview_size, 3))
-        for xx in range(classification_preview_size):
-            for yy in range(classification_preview_size):
-                preview_result[0, xx, yy, :] = \
-                    preview_blends[xx * classification_preview_size + yy, 0] * color_0 + \
-                    preview_blends[xx * classification_preview_size + yy, 1] * color_1
-        tl.vis.save_images(preview_result, [1, 1], name + "/Preview_Ep%d_It%d.png" % (idx, step))
+            preview_result = np.zeros((1, classification_preview_size, classification_preview_size, 3))
+            for xx in range(classification_preview_size):
+                for yy in range(classification_preview_size):
+                    preview_result[0, xx, yy, :] = \
+                        preview_blends[xx * classification_preview_size + yy, 0] * color_0 + \
+                        preview_blends[xx * classification_preview_size + yy, 1] * color_1
+            tl.vis.save_images(preview_result, [1, 1], name + "/Preview_Ep%d_It%d.png" % (idx, step))
 
-        # Store data (Loss & Acc)
-        training_loss /= (dataCount // batch_size)
-        total_acc /= (dataCount // batch_size)
+            # Store data (Loss & Acc)
+            training_loss /= (dataCount // batch_size)
+            total_acc /= (dataCount // batch_size)
 
-        loss_epochs[idx] = training_loss
-        acc_epochs[idx] = total_acc
+            loss_epochs[idx] += training_loss / float(totalLoops)
+            acc_epochs[idx] += total_acc / float(totalLoops)
 
 train()
 
