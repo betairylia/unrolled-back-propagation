@@ -23,6 +23,7 @@ parser.add_argument('outpath')
 parser.add_argument('-gpu', '--cuda-gpus')
 parser.add_argument('-log', '--log_dir', default = 'logs\\')
 parser.add_argument('-lr', '--learning-rate', type=float, default = 0.003, help='Learning rate for momentum SGD')
+parser.add_argument('-lambda', '--lambda-mininf', type=float, default = 0.5, help='Mixture const (hyperparameter) for mininf normalization')
 parser.add_argument('-alpha', '--alpha', type=float, default = 0.9, help='momentum')
 parser.add_argument('-adam', '--adam', dest='adam', action='store_const', const=True, default=False, help='Use Adam instead of momentum SGD')
 parser.add_argument('-bn', '--batchnorm', dest='batchnorm', action='store_const', const=True, default=False, help='Use BatchNorm or not')
@@ -35,12 +36,22 @@ parser.add_argument('-data', '--datacount', type=int, default = 65536, help='How
 parser.add_argument('-bs', '--batchsize', type=int, default = 128, help='Mini-batch size')
 parser.add_argument('-lrelu', dest='activation', action='store_const', const=(lambda x: tl.act.lrelu(x, 0.2)), default=tf.nn.tanh, help='Use lRelu activation instead of tanh')
 parser.add_argument('-adva', '--advancedActivation', dest='advActivation', action='store_const', const=True, default=False, help='Use Advanced activation instead of lRelu or tanh')
+parser.add_argument('-mininf', '--minishInformation', dest='mininf', action='store_const', const=True, default=False, help='Use the minish information normalization term')
+parser.add_argument('-show', '--showWeights', dest='show_weight', action='store_const', const=True, default=False, help='Show weights graph at end')
+parser.add_argument('-aSig', '--anneal-sigma', type=float, default = 0.0, help='Sigma of the initial noise added in parameter space')
+parser.add_argument('-aDecay', '--anneal-decay', type=float, default = 0.9999, help='Decay rate for parameter space noise sigma after every iteration')
 args = parser.parse_args()
 
 if args.adam == True:
     method_str = "Adam"
 else:
     method_str = "SGD(m)-lr%.4f-m%.2f" % (args.learning_rate, args.alpha)
+if args.mininf:
+    method_str += "-mininf%.6f" % (args.lambda_mininf)
+if args.batchnorm:
+    method_str += "-bn"
+
+method_str += "-ainit%.3f-adecay%.6f" % (args.anneal_sigma, args.anneal_decay)
 structure_str = '-'.join(str(e) for e in args.nn_structure)
 
 if args.advActivation == True:
@@ -87,28 +98,46 @@ plt.clf()
 loss_epochs = np.zeros((num_epochs, 1))
 acc_epochs = np.zeros((num_epochs, 1))
 
+# array for weights
+target_weight_arr_1 = np.zeros((num_epochs, network_structure[0] * 2))
+target_weight_arr_2 = np.zeros((num_epochs, network_structure[len(network_structure) - 1] * 2))
+
 def train():
     input_x = tf.placeholder('float32', [batch_size, input_dim], name = "input")
     label_y = tf.placeholder('float32', [batch_size, output_dim], name = "label")
+    ph_anneal_sigma = tf.placeholder('float32', shape = (), name = 'anneal_sigma')
 
-    net, logit_train = network(input_x, output_dim, network_structure, act=args.activation, is_train = True, reuse = False, use_BN = args.batchnorm)
+    net, logit_train, information_norm = network(input_x, output_dim, network_structure, act=args.activation, anneal = ph_anneal_sigma, is_train = True, reuse = False, use_BN = args.batchnorm)
+    information_norm = information_norm / sum(network_structure)
 
     loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(logits = logit_train, labels = label_y))
+    if args.mininf == True:
+        loss_inf = loss + args.lambda_mininf * information_norm
+
     n_vars = tl.layers.get_variables_with_name('network', True, True)
 
     if args.adam == True:
         optimizer = tf.train.AdamOptimizer()
     else:
         optimizer = tf.train.MomentumOptimizer(learning_rate = learning_rate, momentum = alpha)
-    train_op = optimizer.minimize(loss, var_list = n_vars)
+    
+    if args.mininf == True:
+        train_op = optimizer.minimize(loss_inf, var_list = n_vars)
+    else:
+        train_op = optimizer.minimize(loss, var_list = n_vars)
 
     input_preview = tf.placeholder('float32', [classification_preview_size ** 2, input_dim], name = "input_preview")
 
-    _, logit_preview = network(input_preview, output_dim, network_structure, act=args.activation, is_train = False, reuse = True, use_BN = args.batchnorm)
+    _, logit_preview, _ = network(input_preview, output_dim, network_structure, act=args.activation, anneal = ph_anneal_sigma, is_train = False, reuse = True, use_BN = args.batchnorm)
     preview_softmax = tf.nn.softmax(logit_preview)
 
-    _, logit_test = network(input_x, output_dim, network_structure, act=args.activation, is_train = False, reuse = True, use_BN = args.batchnorm)
+    _, logit_test, _ = network(input_x, output_dim, network_structure, act=args.activation, anneal = ph_anneal_sigma, is_train = False, reuse = True, use_BN = args.batchnorm)
     acc, acc_op = tf.metrics.accuracy(labels = tf.argmax(label_y, 1), predictions = tf.argmax(logit_test, 1))
+
+    # For test
+    print(tf.trainable_variables())
+    target_weight_1 = [v for v in tf.trainable_variables() if v.name == "network/layer_0/W:0"][0]
+    target_weight_2 = [v for v in tf.trainable_variables() if v.name == "network/layer_%d/W:0" % len(network_structure)][0]
 
     sess = tf.Session()
     sess.run(tf.local_variables_initializer())
@@ -121,6 +150,8 @@ def train():
         sess.run(tf.local_variables_initializer())
         tl.layers.initialize_global_variables(sess)
 
+        current_anneal_sigma = args.anneal_sigma
+
         for idx, epoch in enumerate(gen_epochs(num_epochs, dataCount, batch_size, input_dim, output_dim, args.loops, args.noise_sigma)):
         
             training_loss = 0
@@ -129,7 +160,7 @@ def train():
             for step, (_x, _y) in enumerate(epoch):
                 
                 # Train
-                _, n_loss = sess.run([train_op, loss], feed_dict={input_x: _x, label_y: _y})
+                _, n_loss, n_inf_norm = sess.run([train_op, loss, information_norm], feed_dict={input_x: _x, label_y: _y, ph_anneal_sigma: current_anneal_sigma})
                 training_loss += n_loss
 
                 # Test
@@ -137,14 +168,20 @@ def train():
                 _, n_acc = sess.run([acc, acc_op], feed_dict={input_x: t_x, label_y: t_y})
                 total_acc += n_acc
 
-                print(colored("Loop #%2d - " % loopCount, 'yellow') + colored("Epoch %3d, Iteration %6d: loss = %.8f, acc = %.8f" % (idx, step, n_loss, n_acc), 'cyan'))
+                print(colored("Loop #%2d - " % loopCount, 'yellow') + colored("Epoch %3d, Iteration %6d:" % (idx, step), 'cyan') + colored("\n\t loss = %.8f;\n\t acc = %.8f;\n\t inf_norm = %.8f;\n\t anneal_sigma = %.5f" % (n_loss, n_acc, n_inf_norm, current_anneal_sigma), 'green'))
+                
+                current_anneal_sigma *= args.anneal_decay
 
             # Preview
             lx = np.linspace(1, -1, classification_preview_size)
             ly = np.linspace(-1, 1, classification_preview_size)
             mx, my = np.meshgrid(ly, lx)
             preview_X = np.array([mx.flatten(), my.flatten()]).T
-            preview_blends = sess.run(preview_softmax, feed_dict = {input_preview: preview_X})
+            preview_blends, l1W, l2W = sess.run([preview_softmax, target_weight_1, target_weight_2], feed_dict = {input_preview: preview_X})
+
+            # Store weights
+            target_weight_arr_1[idx, :] = l1W.reshape((network_structure[0] * 2))
+            target_weight_arr_2[idx, :] = l2W.reshape((network_structure[len(network_structure) - 1] * 2))
 
             color_0 = np.array([0, 0, 1])
             color_1 = np.array([1, 0, 0])
@@ -155,7 +192,7 @@ def train():
                     preview_result[0, xx, yy, :] = \
                         preview_blends[xx * classification_preview_size + yy, 0] * color_0 + \
                         preview_blends[xx * classification_preview_size + yy, 1] * color_1
-            tl.vis.save_images(preview_result, [1, 1], name + "/Preview_Ep%d_It%d.png" % (idx, step))
+            tl.vis.save_images(preview_result, [1, 1], name + "/Preview_Ep%03d.png" % (idx))
 
             # Store data (Loss & Acc)
             training_loss /= (dataCount // batch_size)
@@ -172,7 +209,7 @@ np.save(name + "/AccData.npy", acc_epochs)
 print(colored("Loss & Acc data saved.", 'yellow'))
 
 plt.title("Loss")
-plt.axis((0, 100, 0, 1))
+plt.axis((0, num_epochs, 0, 1))
 plt.plot(loss_epochs)
 plt.savefig(name + "/LossGraph.png")
 print(colored("Loss Graph saved.", 'magenta'))
@@ -180,9 +217,33 @@ plt.clf()
 # plt.show()
 
 plt.title("Accuracy")
-plt.axis((0, 100, 0, 1))
+plt.axis((0, num_epochs, 0, 1))
 plt.plot(acc_epochs)
 plt.savefig(name + "/AccuracyGraph.png")
 print(colored("Accuracy Graph saved.", 'magenta'))
 plt.clf()
 # plt.show()
+
+if args.show_weight:
+
+    plt.title("Weights of first layer")
+    plt.axis((0, num_epochs, -4, 4))
+
+    for i in range(network_structure[0] * 2):
+        plt.plot(target_weight_arr_1[:, i])
+
+    # for i in range(network_structure[0] * network_structure[1]):
+    #     plt.plot(target_weight_arr_2[:, i], 'b')
+
+    plt.show()
+
+    plt.title("Weights of last layer")
+    plt.axis((0, num_epochs, -4, 4))
+
+    # for i in range(network_structure[0] * 2):
+    #     plt.plot(target_weight_arr_1[:, i])
+
+    for i in range(network_structure[len(network_structure) - 1] * 2):
+        plt.plot(target_weight_arr_2[:, i])
+
+    plt.show()

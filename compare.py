@@ -8,6 +8,7 @@ target_dir = sys.argv[1]
 dataDict = {}
 
 for dirpath, _, filenames in os.walk(target_dir):
+    print(dirpath)
     acc = np.zeros((100, 1))
     loss = np.zeros((100, 1))
     flag = False
@@ -19,7 +20,7 @@ for dirpath, _, filenames in os.walk(target_dir):
             flag = True
             loss = np.load(os.path.join(dirpath, name))
     if flag == True:
-        dataDict[dirpath.split('\\')[1]] = {'acc': acc, 'loss': loss}
+        dataDict[dirpath.split('/')[1]] = {'acc': acc, 'loss': loss}
 
 plt.figure(figsize=(8, 8))
 plt.title("Loss in %s" % target_dir)

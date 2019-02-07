@@ -32,6 +32,8 @@ parser.add_argument('-l', '--loops', type=float, default = 3.0, help='Loops coun
 parser.add_argument('-sig', '--noise-sigma', type=float, default = 0.01, help='Sigma of the noise distributaion')
 parser.add_argument('-nn', '--nn-structure', nargs='*', type=int, help='The structure of the network, e.g. 30 20 10 8')
 parser.add_argument('-u', '--unrolled', type=int, default = 5, help='Count of unrolling steps')
+parser.add_argument('-ur', '--unroll-range', type=int, default = 10, help='Range of unrolling layers')
+parser.add_argument('-ug', '--unroll-group', type=int, default = 1, help='Group size of unrolling layers')
 parser.add_argument('-avg', '--average', type=int, default = 1, help='How many times should the network try to get an average loss & acc')
 parser.add_argument('-data', '--datacount', type=int, default = 65536, help='How many data should be generated in an epoch')
 parser.add_argument('-bs', '--batchsize', type=int, default = 128, help='Mini-batch size')
@@ -50,7 +52,7 @@ if args.activation == tf.nn.tanh:
 else:
     act_str = "lRelu"
 
-name = args.outpath.split(' ')[0] + "/(avg%d)Unrolled[%d]-%s(%s-%s)-[lp%1.1f-sig%.2f]" % (args.average, args.unrolled, method_str, act_str, structure_str, args.loops, args.noise_sigma)
+name = args.outpath.split(' ')[0] + "/(avg%d)Unrolled[%d(%dr - %dg)]-%s(%s-%s)-[lp%1.1f-sig%.2f]" % (args.average, args.unrolled, args.unroll_range, args.unroll_group, method_str, act_str, structure_str, args.loops, args.noise_sigma)
 cprint("Output Path: " + name, 'green')
 
 os.system("del /F /Q \"" + name + "\\\"")
@@ -126,15 +128,23 @@ def train():
     input_x = tf.placeholder('float32', [batch_size, input_dim], name = "input")
     label_y = tf.placeholder('float32', [batch_size, output_dim], name = "label")
 
-    net, logit_train = network(input_x, output_dim, network_structure, act=args.activation, is_train = True, reuse = False, use_BN = args.batchnorm)
+    net, logit_train, information_norm = network(input_x, output_dim, network_structure, act=args.activation, is_train = True, reuse = False, use_BN = args.batchnorm)
+    information_norm = information_norm / sum(network_structure)
 
     loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(logits = logit_train, labels = label_y))
     n_vars = tl.layers.get_variables_with_name('network', True, True)
 
     # collect variables
     trainable_vars = []
-    for i in range(0, len(network_structure) + 1):
-        trainable_vars.append(tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "network/layer_%d" % i))
+    for i in range(0, math.ceil((len(network_structure) + 1) / args.unroll_group)):
+
+        print(i)
+        tmp_vars = []
+        for j in range(i * args.unroll_group, min(len(network_structure) + 1, i * args.unroll_group + args.unroll_group)):
+            print(j)
+            tmp_vars += (tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "network/layer_%d" % j))
+            
+        trainable_vars.append(tmp_vars)
 
     # borrowed from https://github.com/poolio/unrolled_gan/blob/master/Unrolled%20GAN%20demo.ipynb
     # unrolled bp
@@ -150,13 +160,15 @@ def train():
 
     layer_train_ops = []
     unrolled_loss = []
-    for i in range(0, len(network_structure) + 1):
+    for i in range(0, math.ceil((len(network_structure) + 1) / args.unroll_group)):
 
         # get the trainable variables
         except_layer_i = []
-        for j in range(0, len(network_structure) + 1):
+        print(range(max(0, i - args.unroll_range), min(len(trainable_vars), i + args.unroll_range + 1)))
+        for j in range(max(0, i - args.unroll_range), min(len(trainable_vars), i + args.unroll_range + 1)):
             if i != j:
-                except_layer_i += trainable_vars[i]
+                print(j)
+                except_layer_i += trainable_vars[j]
         
         if args.unrolled > 0:
             # Unrolled update
@@ -175,14 +187,19 @@ def train():
             unrolled_loss.append(tf.contrib.graph_editor.graph_replace(loss, cur_update_dict))
         else:
             unrolled_loss.append(loss)
+        
+        print(i)
+        print(trainable_vars)
+        print(trainable_vars[i])
+
         layer_train_ops.append(optimizer.minimize(unrolled_loss[i], var_list = trainable_vars[i]))
 
     input_preview = tf.placeholder('float32', [classification_preview_size ** 2, input_dim], name = "input_preview")
 
-    _, logit_preview = network(input_preview, output_dim, network_structure, act=args.activation, is_train = False, reuse = True, use_BN = args.batchnorm)
+    _, logit_preview, _ = network(input_preview, output_dim, network_structure, act=args.activation, is_train = False, reuse = True, use_BN = args.batchnorm)
     preview_softmax = tf.nn.softmax(logit_preview)
 
-    _, logit_test = network(input_x, output_dim, network_structure, act=args.activation, is_train = False, reuse = True, use_BN = args.batchnorm)
+    _, logit_test, _ = network(input_x, output_dim, network_structure, act=args.activation, is_train = False, reuse = True, use_BN = args.batchnorm)
     acc, acc_op = tf.metrics.accuracy(labels = tf.argmax(label_y, 1), predictions = tf.argmax(logit_test, 1))
 
     sess = tf.Session()
@@ -206,8 +223,8 @@ def train():
             for step, (_x, _y) in enumerate(epoch):
                 
                 # Train
-                for layer in range(0, len(network_structure) + 1):
-                    _, n_loss = sess.run([layer_train_ops[layer], unrolled_loss[layer]], feed_dict={input_x: _x, label_y: _y})
+                for layer_group in range(0, math.ceil((len(network_structure) + 1) / args.unroll_group)):
+                    _, n_loss, n_inf_norm = sess.run([layer_train_ops[layer_group], unrolled_loss[layer_group], information_norm], feed_dict={input_x: _x, label_y: _y})
                     training_loss += n_loss / (len(network_structure) + 1)
 
                 # Test
@@ -215,7 +232,7 @@ def train():
                 _, n_acc = sess.run([acc, acc_op], feed_dict={input_x: t_x, label_y: t_y})
                 total_acc += n_acc
 
-                print(colored("Loop #%2d - " % loopCount, 'yellow') + colored("Epoch %3d, Iteration %6d: loss = %.8f, acc = %.8f" % (idx, step, n_loss, n_acc), 'cyan'))
+                print(colored("Loop #%2d - " % loopCount, 'yellow') + colored("Epoch %3d, Iteration %6d:" % (idx, step), 'cyan') + colored("\n\t loss = %.8f;\n\t acc = %.8f;\n\t inf_norm = %.8f" % (n_loss, n_acc, n_inf_norm), 'green'))
 
             # Preview
             lx = np.linspace(1, -1, classification_preview_size)
@@ -233,7 +250,7 @@ def train():
                     preview_result[0, xx, yy, :] = \
                         preview_blends[xx * classification_preview_size + yy, 0] * color_0 + \
                         preview_blends[xx * classification_preview_size + yy, 1] * color_1
-            tl.vis.save_images(preview_result, [1, 1], name + "/Preview_Ep%d_It%d.png" % (idx, step))
+            tl.vis.save_images(preview_result, [1, 1], name + "/Preview_Ep%03d.png" % (idx))
 
             # Store data (Loss & Acc)
             training_loss /= (dataCount // batch_size)

@@ -1,1 +1,1 @@
-from PIL import 
+from PIL import Image

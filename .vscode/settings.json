@@ -1,4 +1,4 @@
 {
-    "python.pythonPath": "C:\\Users\\Betairya_sap\\Anaconda3\\envs\\tensorflow\\python.exe",
+    "python.pythonPath": "/home/betairya/anaconda3/envs/tensorflow/bin/python",
     "python.linting.enabled": false
 }

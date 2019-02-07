@@ -115,3 +115,11 @@ unroll0_test_adam/
 unroll5_test_adam/
 advanced_Act_test/
 Figures/
+weight_log/
+unroll_large/
+unroll_180918/
+subspace_check/
+smallworld_check/
+minish_information/
+anneal_check/
+.vscode/
